@@ -16,19 +16,10 @@
 
 package org.springframework.web.portlet.mvc.annotation;
 
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.Reader;
-import java.io.Writer;
+import java.io.*;
 import java.lang.reflect.Method;
 import java.security.Principal;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.portlet.ActionRequest;
 import javax.portlet.ActionResponse;
@@ -51,6 +42,8 @@ import javax.portlet.ResourceResponse;
 import javax.portlet.StateAwareResponse;
 import javax.portlet.WindowState;
 import javax.servlet.http.Cookie;
+import javax.servlet.http.HttpServletResponse;
+import javax.xml.transform.Source;
 
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.BeanFactory;
@@ -62,6 +55,16 @@ import org.springframework.core.DefaultParameterNameDiscoverer;
 import org.springframework.core.Ordered;
 import org.springframework.core.ParameterNameDiscoverer;
 import org.springframework.core.annotation.AnnotationUtils;
+import org.springframework.http.HttpInputMessage;
+import org.springframework.http.HttpOutputMessage;
+import org.springframework.http.MediaType;
+import org.springframework.http.converter.ByteArrayHttpMessageConverter;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.converter.StringHttpMessageConverter;
+import org.springframework.http.converter.xml.SourceHttpMessageConverter;
+import org.springframework.http.server.PortletServerHttpRequest;
+import org.springframework.http.server.PortletServerHttpResponse;
+import org.springframework.http.server.ServletServerHttpResponse;
 import org.springframework.ui.ExtendedModelMap;
 import org.springframework.ui.Model;
 import org.springframework.util.Assert;
@@ -69,13 +72,9 @@ import org.springframework.util.ClassUtils;
 import org.springframework.util.ObjectUtils;
 import org.springframework.util.StringUtils;
 import org.springframework.validation.support.BindingAwareModelMap;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.bind.WebDataBinder;
-import org.springframework.web.bind.annotation.InitBinder;
-import org.springframework.web.bind.annotation.ModelAttribute;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestMethod;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.SessionAttributes;
+import org.springframework.web.bind.annotation.*;
 import org.springframework.web.bind.annotation.support.HandlerMethodInvoker;
 import org.springframework.web.bind.annotation.support.HandlerMethodResolver;
 import org.springframework.web.bind.support.DefaultSessionAttributeStore;
@@ -144,6 +143,8 @@ public class AnnotationMethodHandlerAdapter extends PortletContentGenerator
 
 	private ModelAndViewResolver[] customModelAndViewResolvers;
 
+    private HttpMessageConverter<?>[] messageConverters;
+
 	private int order = Ordered.LOWEST_PRECEDENCE;
 
 	private ConfigurableBeanFactory beanFactory;
@@ -153,6 +154,15 @@ public class AnnotationMethodHandlerAdapter extends PortletContentGenerator
 	private final Map<Class<?>, PortletHandlerMethodResolver> methodResolverCache =
 			new ConcurrentHashMap<Class<?>, PortletHandlerMethodResolver>(64);
 
+    public AnnotationMethodHandlerAdapter() {
+        // See SPR-7316
+        StringHttpMessageConverter stringHttpMessageConverter = new StringHttpMessageConverter();
+        stringHttpMessageConverter.setWriteAcceptCharset(false);
+        this.messageConverters = new HttpMessageConverter<?>[] {
+                new ByteArrayHttpMessageConverter(), stringHttpMessageConverter,
+                new SourceHttpMessageConverter<Source>(),
+        };
+    }
 
 	/**
 	 * Specify a WebBindingInitializer which will apply pre-configured
@@ -253,6 +263,21 @@ public class AnnotationMethodHandlerAdapter extends PortletContentGenerator
 	public void setCustomModelAndViewResolvers(ModelAndViewResolver[] customModelAndViewResolvers) {
 		this.customModelAndViewResolvers = customModelAndViewResolvers;
 	}
+
+    /**
+     * Set the message body converters to use.
+     * <p>These converters are used to convert from and to HTTP requests and responses.
+     */
+    public void setMessageConverters(HttpMessageConverter<?>[] messageConverters) {
+        this.messageConverters = messageConverters;
+    }
+
+    /**
+     * Return the message body converters that this adapter has been configured with.
+     */
+    public HttpMessageConverter<?>[] getMessageConverters() {
+        return messageConverters;
+    }
 
 	/**
 	 * Specify the order value for this HandlerAdapter bean.
@@ -431,6 +456,29 @@ public class AnnotationMethodHandlerAdapter extends PortletContentGenerator
 		return new PortletRequestDataBinder(target, objectName);
 	}
 
+    /**
+     * Template method for creating a new HttpInputMessage instance.
+     * <p>The default implementation creates a standard {@link org.springframework.http.server.PortletServerHttpRequest}.
+     * This can be overridden for custom {@code HttpInputMessage} implementations
+     * @param portletRequest current HTTP request
+     * @return the HttpInputMessage instance to use
+     * @throws Exception in case of errors
+     */
+    protected HttpInputMessage createHttpInputMessage(PortletRequest portletRequest) throws Exception {
+        return new PortletServerHttpRequest(portletRequest);
+    }
+
+    /**
+     * Template method for creating a new HttpOutputMessage instance.
+     * <p>The default implementation creates a standard {@link org.springframework.http.server.PortletServerHttpResponse}.
+     * This can be overridden for custom {@code HttpOutputMessage} implementations
+     * @param portletResponse current HTTP response
+     * @return the HttpInputMessage instance to use
+     * @throws Exception in case of errors
+     */
+    protected HttpOutputMessage createHttpOutputMessage(PortletResponse portletResponse) throws Exception {
+        return new PortletServerHttpResponse(portletResponse);
+    }
 
 	/**
 	 * Portlet-specific subclass of {@link HandlerMethodResolver}.
@@ -550,7 +598,7 @@ public class AnnotationMethodHandlerAdapter extends PortletContentGenerator
 
 		public PortletHandlerMethodInvoker(HandlerMethodResolver resolver) {
 			super(resolver, webBindingInitializer, sessionAttributeStore,
-					parameterNameDiscoverer, customArgumentResolvers, null);
+					parameterNameDiscoverer, customArgumentResolvers, messageConverters);
 		}
 
 		@Override
@@ -576,6 +624,18 @@ public class AnnotationMethodHandlerAdapter extends PortletContentGenerator
 			PortletRequestDataBinder portletBinder = (PortletRequestDataBinder) binder;
 			portletBinder.bind(webRequest.getNativeRequest(PortletRequest.class));
 		}
+
+        @Override
+        protected HttpInputMessage createHttpInputMessage(NativeWebRequest webRequest) throws Exception {
+            PortletRequest portletRequest = webRequest.getNativeRequest(PortletRequest.class);
+            return AnnotationMethodHandlerAdapter.this.createHttpInputMessage(portletRequest);
+        }
+
+        @Override
+        protected HttpOutputMessage createHttpOutputMessage(NativeWebRequest webRequest) throws Exception {
+            PortletResponse portletResponse = (PortletResponse) webRequest.getNativeResponse();
+            return AnnotationMethodHandlerAdapter.this.createHttpOutputMessage(portletResponse);
+        }
 
 		@Override
 		protected Object resolveDefaultValue(String value) {
@@ -687,7 +747,7 @@ public class AnnotationMethodHandlerAdapter extends PortletContentGenerator
 
 		@SuppressWarnings("unchecked")
 		public ModelAndView getModelAndView(Method handlerMethod, Class<?> handlerType, Object returnValue, ExtendedModelMap implicitModel,
-				PortletWebRequest webRequest) {
+				PortletWebRequest webRequest) throws Exception {
 			// Invoke custom resolvers if present...
 			if (customModelAndViewResolvers != null) {
 				for (ModelAndViewResolver mavResolver : customModelAndViewResolvers) {
@@ -700,6 +760,12 @@ public class AnnotationMethodHandlerAdapter extends PortletContentGenerator
 					}
 				}
 			}
+
+            if ((AnnotationUtils.findAnnotation(handlerMethod, ResponseBody.class) != null)
+                    && AnnotationUtils.findAnnotation(handlerMethod, ResourceMapping.class) != null) {
+                handleResponseBody(returnValue, webRequest);
+                return null;
+            }
 
 			if (returnValue instanceof ModelAndView) {
 				ModelAndView mav = (ModelAndView) returnValue;
@@ -743,6 +809,51 @@ public class AnnotationMethodHandlerAdapter extends PortletContentGenerator
 				throw new IllegalArgumentException("Invalid handler method return value: " + returnValue);
 			}
 		}
+
+        private void handleResponseBody(Object returnValue, PortletWebRequest webRequest)
+                throws Exception {
+            if (returnValue == null) {
+                return;
+            }
+            HttpInputMessage inputMessage = createHttpInputMessage(webRequest);
+            HttpOutputMessage outputMessage = createHttpOutputMessage(webRequest);
+            writeWithMessageConverters(returnValue, inputMessage, outputMessage);
+        }
+
+        @SuppressWarnings({ "unchecked", "rawtypes" })
+        private void writeWithMessageConverters(Object returnValue,
+                                                HttpInputMessage inputMessage, HttpOutputMessage outputMessage)
+                throws IOException, HttpMediaTypeNotAcceptableException {
+            List<MediaType> acceptedMediaTypes = inputMessage.getHeaders().getAccept();
+            if (acceptedMediaTypes.isEmpty()) {
+                acceptedMediaTypes = Collections.singletonList(MediaType.ALL);
+            }
+            MediaType.sortByQualityValue(acceptedMediaTypes);
+            Class<?> returnValueType = returnValue.getClass();
+            List<MediaType> allSupportedMediaTypes = new ArrayList<MediaType>();
+            if (getMessageConverters() != null) {
+                for (MediaType acceptedMediaType : acceptedMediaTypes) {
+                    for (HttpMessageConverter messageConverter : getMessageConverters()) {
+                        if (messageConverter.canWrite(returnValueType, acceptedMediaType)) {
+                            messageConverter.write(returnValue, acceptedMediaType, outputMessage);
+                            if (logger.isDebugEnabled()) {
+                                MediaType contentType = outputMessage.getHeaders().getContentType();
+                                if (contentType == null) {
+                                    contentType = acceptedMediaType;
+                                }
+                                logger.debug("Written [" + returnValue + "] as \"" + contentType +
+                                        "\" using [" + messageConverter + "]");
+                            }
+                            return;
+                        }
+                    }
+                }
+                for (HttpMessageConverter messageConverter : messageConverters) {
+                    allSupportedMediaTypes.addAll(messageConverter.getSupportedMediaTypes());
+                }
+            }
+            throw new HttpMediaTypeNotAcceptableException(allSupportedMediaTypes);
+        }
 	}
 
 
